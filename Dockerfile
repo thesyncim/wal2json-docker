@@ -1,5 +1,5 @@
 FROM postgres:12 AS build
-ENV VERSION 1_0
+ENV VERSION 2_4
 RUN buildDeps="curl build-essential ca-certificates git   pkg-config glib2.0 postgresql-server-dev-$PG_MAJOR" \
     && apt-get update \
     && apt-get install -y --no-install-recommends  ${buildDeps} \
