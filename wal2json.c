@@ -3,7 +3,7 @@
  * wal2json.c
  * 		JSON output plugin for changeset extraction
  *
- * Copyright (c) 2013-2019, Euler Taveira de Oliveira
+ * Copyright (c) 2013-2022, Euler Taveira de Oliveira
  *
  * IDENTIFICATION
  *		contrib/wal2json/wal2json.c
@@ -12,11 +12,20 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/heapam.h"
+#include "access/sysattr.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_attrdef.h"
 #include "catalog/pg_type.h"
 
 #include "replication/logical.h"
+#if	PG_VERSION_NUM >= 90500
+#include "replication/origin.h"
+#endif
 
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/json.h"
 #include "utils/lsyscache.h"
@@ -35,6 +44,14 @@ extern void	PGDLLEXPORT	_PG_output_plugin_init(OutputPluginCallbacks *cb);
 
 typedef struct
 {
+	bool	insert;
+	bool	update;
+	bool	delete;
+	bool	truncate;
+} JsonAction;
+
+typedef struct
+{
 	MemoryContext context;
 	bool		include_transaction;	/* BEGIN and COMMIT objects (v2) */
 	bool		include_xids;		/* include transaction ids */
@@ -44,11 +61,18 @@ typedef struct
 	bool		include_types;		/* include data types */
 	bool		include_type_oids;	/* include data type oids */
 	bool		include_typmod;		/* include typmod in types */
+	bool		include_domain_data_type;	/* include underlying data type of the domain */
+	bool		include_column_positions;	/* include column numbers */
 	bool		include_not_null;	/* include not-null constraints */
+	bool		include_default;	/* include default expressions */
+	bool		include_pk;			/* include primary key */
 
 	bool		pretty_print;		/* pretty-print JSON? */
-	bool		write_in_chunks;	/* write in chunks? */
+	bool		write_in_chunks;	/* write in chunks? (v1) */
 
+	JsonAction	actions;			/* output only these actions */
+
+	List		*filter_origins;	/* filter out origins */
 	List		*filter_tables;		/* filter out tables */
 	List		*add_tables;		/* add only these tables */
 	List		*filter_msg_prefixes;	/* filter by message prefixes */
@@ -74,7 +98,8 @@ typedef struct
 typedef enum
 {
 	PGOUTPUTJSON_CHANGE,
-	PGOUTPUTJSON_IDENTITY
+	PGOUTPUTJSON_IDENTITY,
+	PGOUTPUTJSON_PK
 } PGOutputJsonKind;
 
 typedef struct SelectTable
@@ -95,16 +120,33 @@ static void pg_decode_commit_txn(LogicalDecodingContext *ctx,
 static void pg_decode_change(LogicalDecodingContext *ctx,
 				 ReorderBufferTXN *txn, Relation rel,
 				 ReorderBufferChange *change);
+#if	PG_VERSION_NUM >= 90500
+static bool pg_filter_by_origin(LogicalDecodingContext *ctx, RepOriginId origin_id);
+#endif
 #if	PG_VERSION_NUM >= 90600
 static void pg_decode_message(LogicalDecodingContext *ctx,
 					ReorderBufferTXN *txn, XLogRecPtr lsn,
 					bool transactional, const char *prefix,
 					Size content_size, const char *content);
 #endif
+#if	PG_VERSION_NUM >= 110000
+static void pg_decode_truncate(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change);
+#endif
 
+static void columns_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, bool addcomma, Relation relation);
+static void tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs, bool replident, bool addcomma, Relation relation);
+static void pk_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs, bool addcomma);
+static void identity_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs);
 static bool parse_table_identifier(List *qualified_tables, char separator, List **select_tables);
 static bool string_to_SelectTable(char *rawstring, char separator, List **select_tables);
 static bool split_string_to_list(char *rawstring, char separator, List **sl);
+static bool split_string_to_oid_list(char *rawstring, char separator, List **sl);
+
+static bool pg_filter_by_action(int change_type, JsonAction actions);
+static bool pg_filter_by_table(List *filter_tables, char *schemaname, char *tablename);
+static bool pg_add_by_table(List *add_tables, char *schemaname, char *tablename);
 
 /* version 1 */
 static void pg_decode_begin_txn_v1(LogicalDecodingContext *ctx,
@@ -119,6 +161,11 @@ static void pg_decode_message_v1(LogicalDecodingContext *ctx,
 					ReorderBufferTXN *txn, XLogRecPtr lsn,
 					bool transactional, const char *prefix,
 					Size content_size, const char *content);
+#endif
+#if	PG_VERSION_NUM >= 110000
+static void pg_decode_truncate_v1(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change);
 #endif
 
 /* version 2 */
@@ -138,6 +185,24 @@ static void pg_decode_message_v2(LogicalDecodingContext *ctx,
 					bool transactional, const char *prefix,
 					Size content_size, const char *content);
 #endif
+#if	PG_VERSION_NUM >= 110000
+static void pg_decode_truncate_v2(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change);
+#endif
+
+/*
+ * Backward compatibility.
+ *
+ * This macro is only available in 9.6+.
+ */
+#if PG_VERSION_NUM < 90600
+#ifdef USE_FLOAT8_BYVAL
+#define UInt64GetDatum(X) ((Datum) (X))
+#else
+#define UInt64GetDatum(X) Int64GetDatum((int64) (X))
+#endif
+#endif
 
 void
 _PG_init(void)
@@ -155,8 +220,14 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->change_cb = pg_decode_change;
 	cb->commit_cb = pg_decode_commit_txn;
 	cb->shutdown_cb = pg_decode_shutdown;
+#if	PG_VERSION_NUM >= 90500
+	cb->filter_by_origin_cb = pg_filter_by_origin;
+#endif
 #if	PG_VERSION_NUM >= 90600
 	cb->message_cb = pg_decode_message;
+#endif
+#if	PG_VERSION_NUM >= 110000
+	cb->truncate_cb = pg_decode_truncate;
 #endif
 }
 
@@ -182,25 +253,46 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->include_transaction = true;
 	data->include_xids = false;
 	data->include_timestamp = false;
+	data->include_pk = false;
 	data->include_origin = false;
 	data->include_schemas = true;
 	data->include_types = true;
 	data->include_type_oids = false;
 	data->include_typmod = true;
+	data->include_domain_data_type = false;
+	data->include_column_positions = false;
 	data->pretty_print = false;
 	data->write_in_chunks = false;
 	data->include_lsn = false;
 	data->include_not_null = false;
+	data->include_default = false;
+	data->filter_origins = NIL;
 	data->filter_tables = NIL;
 	data->filter_msg_prefixes = NIL;
 	data->add_msg_prefixes = NIL;
 
-	data->format_version = WAL2JSON_FORMAT_VERSION;
+	data->format_version = 1;
+
+	/* default actions */
+	if (WAL2JSON_FORMAT_VERSION == 1)
+	{
+		data->actions.insert = true;
+		data->actions.update = true;
+		data->actions.delete = true;
+		data->actions.truncate = false;		/* backward compatibility */
+	}
+	else
+	{
+		data->actions.insert = true;
+		data->actions.update = true;
+		data->actions.delete = true;
+		data->actions.truncate = true;
+	}
 
 	/* pretty print */
-	strcpy(data->ht, "");
-	strcpy(data->nl, "");
-	strcpy(data->sp, "");
+	data->ht[0] = '\0';
+	data->nl[0] = '\0';
+	data->sp[0] = '\0';
 
 	/* add all tables in all schemas by default */
 	t = palloc0(sizeof(SelectTable));
@@ -253,6 +345,19 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 				data->include_timestamp = true;
 			}
 			else if (!parse_bool(strVal(elem->arg), &data->include_timestamp))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-pk") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "include-pk argument is null");
+				data->include_pk = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_pk))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -323,6 +428,32 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
 							 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "include-domain-data-type") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "include-types argument is null");
+				data->include_domain_data_type = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_domain_data_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-column-positions") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "include-column-positions argument is null");
+				data->include_column_positions = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_column_positions))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
 		else if (strcmp(elem->defname, "include-not-null") == 0)
 		{
 			if (elem->arg == NULL)
@@ -331,6 +462,19 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 				data->include_not_null = true;
 			}
 			else if (!parse_bool(strVal(elem->arg), &data->include_not_null))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+							 strVal(elem->arg), elem->defname)));
+		}
+		else if (strcmp(elem->defname, "include-default") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "include-default argument is null");
+				data->include_default = true;
+			}
+			else if (!parse_bool(strVal(elem->arg), &data->include_default))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
@@ -351,9 +495,9 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 
 			if (data->pretty_print)
 			{
-				strncpy(data->ht, "\t", 1);
-				strncpy(data->nl, "\n", 1);
-				strncpy(data->sp, " ", 1);
+				data->ht[0] = '\t';
+				data->nl[0] = '\n';
+				data->sp[0] = ' ';
 			}
 		}
 		else if (strcmp(elem->defname, "write-in-chunks") == 0)
@@ -387,6 +531,81 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("parameter \"%s\" was deprecated", elem->defname)));
+		}
+		else if (strcmp(elem->defname, "actions") == 0)
+		{
+			char	*rawstr;
+
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "actions argument is null");
+				/* argument null means default; nothing to do here */
+			}
+			else
+			{
+				List		*selected_actions = NIL;
+				ListCell	*lc;
+
+				rawstr = pstrdup(strVal(elem->arg));
+				if (!split_string_to_list(rawstr, ',', &selected_actions))
+				{
+					pfree(rawstr);
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_NAME),
+							 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								 strVal(elem->arg), elem->defname)));
+				}
+
+				data->actions.insert = false;
+				data->actions.update = false;
+				data->actions.delete = false;
+				data->actions.truncate = false;
+
+				foreach(lc, selected_actions)
+				{
+					char *p = lfirst(lc);
+
+					if (strcmp(p, "insert") == 0)
+						data->actions.insert = true;
+					else if (strcmp(p, "update") == 0)
+						data->actions.update = true;
+					else if (strcmp(p, "delete") == 0)
+						data->actions.delete = true;
+					else if (strcmp(p, "truncate") == 0)
+						data->actions.truncate = true;
+					else
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+									 p, elem->defname)));
+				}
+
+				pfree(rawstr);
+				list_free(selected_actions);
+			}
+		}
+		else if (strcmp(elem->defname, "filter-origins") == 0)
+		{
+			char	*rawstr;
+
+			if (elem->arg == NULL)
+			{
+				elog(DEBUG1, "filter-origins argument is null");
+				data->filter_origins = NIL;
+			}
+			else
+			{
+				rawstr = pstrdup(strVal(elem->arg));
+				if (!split_string_to_oid_list(rawstr, ',', &data->filter_origins))
+				{
+					pfree(rawstr);
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_NAME),
+							 errmsg("could not parse value \"%s\" for parameter \"%s\"",
+								 strVal(elem->arg), elem->defname)));
+				}
+				pfree(rawstr);
+			}
 		}
 		else if (strcmp(elem->defname, "filter-tables") == 0)
 		{
@@ -535,6 +754,33 @@ pg_decode_shutdown(LogicalDecodingContext *ctx)
 	MemoryContextDelete(data->context);
 }
 
+#if PG_VERSION_NUM >= 90500
+static bool
+pg_filter_by_origin(LogicalDecodingContext *ctx, RepOriginId origin_id)
+{
+	JsonDecodingData *data = ctx->output_plugin_private;
+
+	elog(DEBUG3, "origin: %u", origin_id);
+
+	/* changes produced locally are never filtered */
+	if (origin_id == InvalidRepOriginId)
+		return false;
+
+	/* Filter origins, if available */
+	if (list_length(data->filter_origins) > 0 && list_member_oid(data->filter_origins, origin_id))
+	{
+		elog(DEBUG2, "origin \"%u\" was filtered out", origin_id);
+		return true;
+	}
+
+	/*
+	 * There isn't a list of origins to filter or origin is not contained in
+	 * the filter list hence forward to all subscribers.
+	 */
+	return false;
+}
+#endif
+
 /* BEGIN callback */
 static void
 pg_decode_begin_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
@@ -566,7 +812,7 @@ pg_decode_begin_txn_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 
 	if (data->include_lsn)
 	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, txn->end_lsn));
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(txn->end_lsn)));
 
 		appendStringInfo(ctx->out, "%s\"nextlsn\":%s\"%s\",%s", data->ht, data->sp, lsn_str, data->nl);
 
@@ -610,8 +856,12 @@ pg_decode_begin_txn_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn)
 
 	if (data->include_lsn)
 	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, txn->final_lsn));
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(txn->final_lsn)));
 		appendStringInfo(ctx->out, ",\"lsn\":\"%s\"", lsn_str);
+		pfree(lsn_str);
+
+		lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(txn->end_lsn)));
+		appendStringInfo(ctx->out, ",\"nextlsn\":\"%s\"", lsn_str);
 		pfree(lsn_str);
 	}
 
@@ -626,6 +876,13 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 {
 	JsonDecodingData *data = ctx->output_plugin_private;
 
+#if PG_VERSION_NUM >= 100000
+	OutputPluginUpdateProgress(ctx);
+#endif
+
+	elog(DEBUG2, "my change counter: " UINT64_FORMAT " ; # of changes: " UINT64_FORMAT " ; # of changes in memory: " UINT64_FORMAT, data->nr_changes, txn->nentries, txn->nentries_mem);
+	elog(DEBUG2, "# of subxacts: %d", txn->nsubtxns);
+
 	if (data->format_version == 2)
 		pg_decode_commit_txn_v2(ctx, txn, commit_lsn);
 	else if (data->format_version == 1)
@@ -639,13 +896,6 @@ pg_decode_commit_txn_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 					 XLogRecPtr commit_lsn)
 {
 	JsonDecodingData *data = ctx->output_plugin_private;
-
-	if (txn->has_catalog_changes)
-		elog(DEBUG2, "txn has catalog changes: yes");
-	else
-		elog(DEBUG2, "txn has catalog changes: no");
-	elog(DEBUG2, "my change counter: %lu ; # of changes: %lu ; # of changes in memory: %lu", data->nr_changes, txn->nentries, txn->nentries_mem);
-	elog(DEBUG2, "# of subxacts: %d", txn->nsubtxns);
 
 	/* Transaction ends */
 	if (data->write_in_chunks)
@@ -684,8 +934,12 @@ pg_decode_commit_txn_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	if (data->include_lsn)
 	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, commit_lsn));
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(commit_lsn)));
 		appendStringInfo(ctx->out, ",\"lsn\":\"%s\"", lsn_str);
+		pfree(lsn_str);
+
+		lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(txn->end_lsn)));
+		appendStringInfo(ctx->out, ",\"nextlsn\":\"%s\"", lsn_str);
 		pfree(lsn_str);
 	}
 
@@ -693,15 +947,13 @@ pg_decode_commit_txn_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	OutputPluginWrite(ctx, true);
 }
 
-
 /*
  * Accumulate tuple information and stores it at the end
  *
  * replident: is this tuple a replica identity?
- * hasreplident: does this tuple has an associated replica identity?
  */
 static void
-tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, TupleDesc indexdesc, bool replident, bool hasreplident)
+tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs, bool replident, bool addcomma, Relation relation)
 {
 	JsonDecodingData	*data;
 	int					natt;
@@ -709,9 +961,13 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 	StringInfoData		colnames;
 	StringInfoData		coltypes;
 	StringInfoData		coltypeoids;
+	StringInfoData		colpositions;
 	StringInfoData		colnotnulls;
+	StringInfoData		coldefaults;
 	StringInfoData		colvalues;
 	char				comma[3] = "";
+
+	Relation			defrel = NULL;
 
 	data = ctx->output_plugin_private;
 
@@ -719,8 +975,12 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 	initStringInfo(&coltypes);
 	if (data->include_type_oids)
 		initStringInfo(&coltypeoids);
+	if (data->include_column_positions)
+		initStringInfo(&colpositions);
 	if (data->include_not_null)
 		initStringInfo(&colnotnulls);
+	if (data->include_default)
+		initStringInfo(&coldefaults);
 	initStringInfo(&colvalues);
 
 	/*
@@ -743,9 +1003,22 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 		appendStringInfo(&coltypes, "%s%s%s\"columntypes\":%s[", data->ht, data->ht, data->ht, data->sp);
 		if (data->include_type_oids)
 			appendStringInfo(&coltypeoids, "%s%s%s\"columntypeoids\":%s[", data->ht, data->ht, data->ht, data->sp);
+		if (data->include_column_positions)
+			appendStringInfo(&colpositions, "%s%s%s\"columnpositions\":%s[", data->ht, data->ht, data->ht, data->sp);
 		if (data->include_not_null)
 			appendStringInfo(&colnotnulls, "%s%s%s\"columnoptionals\":%s[", data->ht, data->ht, data->ht, data->sp);
+		if (data->include_default)
+			appendStringInfo(&coldefaults, "%s%s%s\"columndefaults\":%s[", data->ht, data->ht, data->ht, data->sp);
 		appendStringInfo(&colvalues, "%s%s%s\"columnvalues\":%s[", data->ht, data->ht, data->ht, data->sp);
+	}
+
+	if (!replident && data->include_default)
+	{
+#if PG_VERSION_NUM >= 120000
+		defrel = table_open(AttrDefaultRelationId, AccessShareLock);
+#else
+		defrel = heap_open(AttrDefaultRelationId, AccessShareLock);
+#endif
 	}
 
 	/* Print column information (name, type, value) */
@@ -778,32 +1051,9 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 		if (attr->attisdropped || attr->attnum < 0)
 			continue;
 
-		/* Search indexed columns in whole heap tuple */
-		if (indexdesc != NULL)
-		{
-			int		j;
-			bool	found_col = false;
-
-			for (j = 0; j < indexdesc->natts; j++)
-			{
-				Form_pg_attribute	iattr;
-
-				/* See explanation a few lines above. */
-#if (PG_VERSION_NUM >= 90600 && PG_VERSION_NUM < 90605) || (PG_VERSION_NUM >= 90500 && PG_VERSION_NUM < 90509) || (PG_VERSION_NUM >= 90400 && PG_VERSION_NUM < 90414)
-				iattr = indexdesc->attrs[j];
-#else
-				iattr = TupleDescAttr(indexdesc, j);
-#endif
-
-				if (strcmp(NameStr(attr->attname), NameStr(iattr->attname)) == 0)
-					found_col = true;
-
-			}
-
-			/* Print only indexed columns */
-			if (!found_col)
-				continue;
-		}
+		/* Replica identity column? */
+		if (bs != NULL && !bms_is_member(attr->attnum - FirstLowInvalidHeapAttributeNumber, bs))
+			continue;
 
 		/* Get Datum from tuple */
 		origval = heap_getattr(tuple, natt + 1, tupdesc, &isnull);
@@ -835,21 +1085,57 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 
 		if (data->include_types)
 		{
-			if (data->include_typmod)
-			{
-				char	*type_str;
+			char	*type_str;
+			int		len;
+			Form_pg_type type_form = (Form_pg_type) GETSTRUCT(type_tuple);
 
-				type_str = TextDatumGetCString(DirectFunctionCall2(format_type, attr->atttypid, attr->atttypmod));
-				appendStringInfo(&coltypes, "%s", comma);
-				escape_json(&coltypes, type_str);
-				pfree(type_str);
+			/*
+			 * It is a domain. Replace domain name with base data type if
+			 * include_domain_data_type is enabled.
+			 */
+			if (type_form->typtype == TYPTYPE_DOMAIN && data->include_domain_data_type)
+			{
+				typid = type_form->typbasetype;
+				if (data->include_typmod)
+				{
+					getTypeOutputInfo(typid, &typoutput, &typisvarlena);
+					type_str = format_type_with_typemod(type_form->typbasetype, type_form->typtypmod);
+				}
+				else
+				{
+					/*
+					 * Since we are not using a format function, grab base type
+					 * name from Form_pg_type.
+					 */
+					type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+					if (!HeapTupleIsValid(type_tuple))
+						elog(ERROR, "cache lookup failed for type %u", typid);
+					type_form = (Form_pg_type) GETSTRUCT(type_tuple);
+					type_str = pstrdup(NameStr(type_form->typname));
+				}
 			}
 			else
 			{
-				Form_pg_type type_form = (Form_pg_type) GETSTRUCT(type_tuple);
-				appendStringInfo(&coltypes, "%s", comma);
-				escape_json(&coltypes, NameStr(type_form->typname));
+				if (data->include_typmod)
+					type_str = TextDatumGetCString(DirectFunctionCall2(format_type, attr->atttypid, attr->atttypmod));
+				else
+					type_str = pstrdup(NameStr(type_form->typname));
 			}
+
+			appendStringInfo(&coltypes, "%s", comma);
+			/*
+			 * format_type() returns a quoted identifier, if
+			 * required. In this case, it doesn't need to enclose the type name
+			 * in double quotes. However, if it is an array type, it should
+			 * escape it because the brackets are outside the double quotes.
+			 */
+			len = strlen(type_str);
+			if (type_str[0] == '"' && type_str[len - 1] != ']')
+				appendStringInfo(&coltypes, "%s", type_str);
+			else
+				escape_json(&coltypes, type_str);
+
+			pfree(type_str);
 
 			/* oldkeys doesn't print not-null constraints */
 			if (!replident && data->include_not_null)
@@ -865,6 +1151,74 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 			appendStringInfo(&coltypeoids, "%s%u", comma, typid);
 
 		ReleaseSysCache(type_tuple);
+
+		if (!replident && data->include_column_positions)
+			appendStringInfo(&colpositions, "%s%d", comma, attr->attnum);
+
+		/*
+		 * Print default for columns.
+		 */
+		if (!replident && data->include_default)
+		{
+#if PG_VERSION_NUM >= 120000
+			if (attr->atthasdef && attr->attgenerated == '\0')
+#else
+			if (attr->atthasdef)
+#endif
+			{
+				ScanKeyData			scankeys[2];
+				SysScanDesc			scan;
+				HeapTuple			def_tuple;
+				Datum				def_value;
+				bool				isnull;
+				char				*result;
+
+				ScanKeyInit(&scankeys[0],
+							Anum_pg_attrdef_adrelid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(relation->rd_id));
+				ScanKeyInit(&scankeys[1],
+							Anum_pg_attrdef_adnum,
+							BTEqualStrategyNumber, F_INT2EQ,
+							Int16GetDatum(attr->attnum));
+
+				scan = systable_beginscan(defrel, AttrDefaultIndexId, true,
+											NULL, 2, scankeys);
+
+				def_tuple = systable_getnext(scan);
+				if (HeapTupleIsValid(def_tuple))
+				{
+					def_value = fastgetattr(def_tuple, Anum_pg_attrdef_adbin, defrel->rd_att, &isnull);
+
+					if (!isnull)
+					{
+						result = TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
+																	def_value,
+																	ObjectIdGetDatum(relation->rd_id)));
+
+						appendStringInfo(&coldefaults, "%s\"%s\"", comma, result);
+						pfree(result);
+					}
+					else
+					{
+						/*
+						 * null means that default was not set. Is it possible?
+						 * atthasdef shouldn't be set.
+						 */
+						appendStringInfo(&coldefaults, "%snull", comma);
+					}
+				}
+
+				systable_endscan(scan);
+			}
+			else
+			{
+				/*
+				 * no DEFAULT clause implicitly means that the default is NULL
+				 */
+				appendStringInfo(&coldefaults, "%snull", comma);
+			}
+		}
 
 		if (isnull)
 		{
@@ -931,6 +1285,15 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 			snprintf(comma, 3, ",%s", data->sp);
 	}
 
+	if (!replident && data->include_default)
+	{
+#if PG_VERSION_NUM >= 120000
+		table_close(defrel, AccessShareLock);
+#else
+		heap_close(defrel, AccessShareLock);
+#endif
+	}
+
 	/* Column info ends */
 	if (replident)
 	{
@@ -949,9 +1312,13 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 			appendStringInfo(&coltypes, "],%s", data->nl);
 		if (data->include_type_oids)
 			appendStringInfo(&coltypeoids, "],%s", data->nl);
+		if (data->include_column_positions)
+			appendStringInfo(&colpositions, "],%s", data->nl);
 		if (data->include_not_null)
 			appendStringInfo(&colnotnulls, "],%s", data->nl);
-		if (hasreplident)
+		if (data->include_default)
+			appendStringInfo(&coldefaults, "],%s", data->nl);
+		if (addcomma)
 			appendStringInfo(&colvalues, "],%s", data->nl);
 		else
 			appendStringInfo(&colvalues, "]%s", data->nl);
@@ -963,32 +1330,246 @@ tuple_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tu
 		appendStringInfoString(ctx->out, coltypes.data);
 	if (data->include_type_oids)
 		appendStringInfoString(ctx->out, coltypeoids.data);
+	if (data->include_column_positions)
+		appendStringInfoString(ctx->out, colpositions.data);
 	if (data->include_not_null)
 		appendStringInfoString(ctx->out, colnotnulls.data);
+	if (data->include_default)
+		appendStringInfoString(ctx->out, coldefaults.data);
 	appendStringInfoString(ctx->out, colvalues.data);
 
 	pfree(colnames.data);
 	pfree(coltypes.data);
 	if (data->include_type_oids)
 		pfree(coltypeoids.data);
+	if (data->include_column_positions)
+		pfree(colpositions.data);
 	if (data->include_not_null)
 		pfree(colnotnulls.data);
+	if (data->include_default)
+		pfree(coldefaults.data);
 	pfree(colvalues.data);
 }
 
 /* Print columns information */
 static void
-columns_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, bool hasreplident)
+columns_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, bool addcomma, Relation relation)
 {
-	tuple_to_stringinfo(ctx, tupdesc, tuple, NULL, false, hasreplident);
+	tuple_to_stringinfo(ctx, tupdesc, tuple, NULL, false, addcomma, relation);
 }
 
 /* Print replica identity information */
 static void
-identity_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, TupleDesc indexdesc)
+identity_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs)
 {
 	/* Last parameter does not matter */
-	tuple_to_stringinfo(ctx, tupdesc, tuple, indexdesc, true, false);
+	tuple_to_stringinfo(ctx, tupdesc, tuple, bs, true, false, NULL);
+}
+
+/* Print primary key information */
+static void
+pk_to_stringinfo(LogicalDecodingContext *ctx, TupleDesc tupdesc, HeapTuple tuple, Bitmapset *bs, bool addcomma)
+{
+	JsonDecodingData	*data;
+	int					natt;
+	char				comma[3] = "";
+
+	StringInfoData		pknames;
+	StringInfoData		pktypes;
+
+	data = ctx->output_plugin_private;
+
+	initStringInfo(&pknames);
+	initStringInfo(&pktypes);
+
+	appendStringInfo(&pknames, "%s%s%s\"pk\":%s{%s", data->ht, data->ht, data->ht, data->sp, data->nl);
+	appendStringInfo(&pknames, "%s%s%s%s\"pknames\":%s[", data->ht, data->ht, data->ht, data->ht, data->sp);
+	appendStringInfo(&pktypes, "%s%s%s%s\"pktypes\":%s[", data->ht, data->ht, data->ht, data->ht, data->sp);
+
+	/* Print column information (name, type, value) */
+	for (natt = 0; natt < tupdesc->natts; natt++)
+	{
+		Form_pg_attribute	attr;		/* the attribute itself */
+		Oid					typid;		/* type of current attribute */
+		HeapTuple			type_tuple;	/* information about a type */
+
+		/*
+		 * Commit d34a74dd064af959acd9040446925d9d53dff15b introduced
+		 * TupleDescAttr() in back branches. If the version supports
+		 * this macro, use it. Version 10 and later already support it.
+		 */
+#if (PG_VERSION_NUM >= 90600 && PG_VERSION_NUM < 90605) || (PG_VERSION_NUM >= 90500 && PG_VERSION_NUM < 90509) || (PG_VERSION_NUM >= 90400 && PG_VERSION_NUM < 90414)
+		attr = tupdesc->attrs[natt];
+#else
+		attr = TupleDescAttr(tupdesc, natt);
+#endif
+
+		/* Do not print dropped or system columns */
+		if (attr->attisdropped || attr->attnum < 0)
+			continue;
+
+		/* Primary key column? */
+		if (bs != NULL && !bms_is_member(attr->attnum - FirstLowInvalidHeapAttributeNumber, bs))
+			continue;
+
+		typid = attr->atttypid;
+
+		/* Figure out type name */
+		type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (!HeapTupleIsValid(type_tuple))
+			elog(ERROR, "cache lookup failed for type %u", typid);
+
+		/* Accumulate each column info */
+		appendStringInfo(&pknames, "%s", comma);
+		escape_json(&pknames, NameStr(attr->attname));
+
+		if (data->include_types)
+		{
+			char	*type_str;
+			Form_pg_type type_form = (Form_pg_type) GETSTRUCT(type_tuple);
+
+			/*
+			 * It is a domain. Replace domain name with base data type if
+			 * include_domain_data_type is enabled.
+			 */
+			if (type_form->typtype == TYPTYPE_DOMAIN && data->include_domain_data_type)
+			{
+				typid = type_form->typbasetype;
+				if (data->include_typmod)
+				{
+					type_str = format_type_with_typemod(type_form->typbasetype, type_form->typtypmod);
+				}
+				else
+				{
+					/*
+					 * Since we are not using a format function, grab base type
+					 * name from Form_pg_type.
+					 */
+					type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+					if (!HeapTupleIsValid(type_tuple))
+						elog(ERROR, "cache lookup failed for type %u", typid);
+					type_form = (Form_pg_type) GETSTRUCT(type_tuple);
+					type_str = pstrdup(NameStr(type_form->typname));
+				}
+			}
+			else
+			{
+				if (data->include_typmod)
+					type_str = TextDatumGetCString(DirectFunctionCall2(format_type, attr->atttypid, attr->atttypmod));
+				else
+					type_str = pstrdup(NameStr(type_form->typname));
+			}
+
+			appendStringInfo(&pktypes, "%s", comma);
+			/*
+			 * format_type() returns a quoted identifier, if
+			 * required. In this case, it doesn't need to enclose the type name
+			 * in double quotes.
+			 */
+			if (type_str[0] == '"')
+				appendStringInfo(&pktypes, "%s", type_str);
+			else
+				escape_json(&pktypes, type_str);
+
+			pfree(type_str);
+		}
+
+		ReleaseSysCache(type_tuple);
+
+		/* The first column does not have comma */
+		if (strcmp(comma, "") == 0)
+			snprintf(comma, 3, ",%s", data->sp);
+	}
+
+	appendStringInfo(&pknames, "],%s", data->nl);
+	appendStringInfo(&pktypes, "]%s", data->nl);
+	if (addcomma)
+		appendStringInfo(&pktypes, "%s%s%s},%s", data->ht, data->ht, data->ht, data->nl);
+	else
+		appendStringInfo(&pktypes, "%s%s%s}%s", data->ht, data->ht, data->ht, data->nl);
+
+	appendStringInfoString(ctx->out, pknames.data);
+	appendStringInfoString(ctx->out, pktypes.data);
+
+	pfree(pknames.data);
+	pfree(pktypes.data);
+}
+
+static bool
+pg_filter_by_action(int change_type, JsonAction actions)
+{
+	if (change_type == REORDER_BUFFER_CHANGE_INSERT && !actions.insert)
+	{
+		elog(DEBUG3, "ignore INSERT");
+		return true;
+	}
+	if (change_type == REORDER_BUFFER_CHANGE_UPDATE && !actions.update)
+	{
+		elog(DEBUG3, "ignore UPDATE");
+		return true;
+	}
+	if (change_type == REORDER_BUFFER_CHANGE_DELETE && !actions.delete)
+	{
+		elog(DEBUG3, "ignore DELETE");
+		return true;
+	}
+
+	return false;
+}
+
+static bool
+pg_filter_by_table(List *filter_tables, char *schemaname, char *tablename)
+{
+	if (list_length(filter_tables) > 0)
+	{
+		ListCell	*lc;
+
+		foreach(lc, filter_tables)
+		{
+			SelectTable	*t = lfirst(lc);
+
+			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
+			{
+				if (t->alltables || strcmp(t->tablename, tablename) == 0)
+				{
+					elog(DEBUG2, "\"%s\".\"%s\" was filtered out",
+								((t->allschemas) ? "*" : t->schemaname),
+								((t->alltables) ? "*" : t->tablename));
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+static bool
+pg_add_by_table(List *add_tables, char *schemaname, char *tablename)
+{
+	if (list_length(add_tables) > 0)
+	{
+		ListCell	*lc;
+
+		/* all tables in all schemas are added by default */
+		foreach(lc, add_tables)
+		{
+			SelectTable	*t = lfirst(lc);
+
+			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
+			{
+				if (t->alltables || strcmp(t->tablename, tablename) == 0)
+				{
+					elog(DEBUG2, "\"%s\".\"%s\" was added",
+								((t->allschemas) ? "*" : t->schemaname),
+								((t->alltables) ? "*" : t->tablename));
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
 }
 
 /* Callback for individual changed tuples */
@@ -1015,8 +1596,8 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	TupleDesc	tupdesc;
 	MemoryContext old;
 
-	Relation	indexrel;
-	TupleDesc	indexdesc;
+	Bitmapset	*pkbs = NULL;
+	Bitmapset	*ribs = NULL;
 
 	char		*schemaname;
 	char		*tablename;
@@ -1024,6 +1605,11 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	AssertVariableIsOfType(&pg_decode_change, LogicalDecodeChangeCB);
 
 	data = ctx->output_plugin_private;
+
+	/* filter changes by action */
+	if (pg_filter_by_action(change->action, data->actions))
+		return;
+
 	class_form = RelationGetForm(relation);
 	tupdesc = RelationGetDescr(relation);
 
@@ -1041,56 +1627,21 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	RelationGetIndexList(relation);
 
 	/* Filter tables, if available */
-	if (list_length(data->filter_tables) > 0)
+	if (pg_filter_by_table(data->filter_tables, schemaname, tablename))
 	{
-		ListCell	*lc;
-
-		foreach(lc, data->filter_tables)
-		{
-			SelectTable	*t = lfirst(lc);
-
-			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
-			{
-				if (t->alltables || strcmp(t->tablename, tablename) == 0)
-				{
-					elog(DEBUG2, "\"%s\".\"%s\" was filtered out",
-								((t->allschemas) ? "*" : t->schemaname),
-								((t->alltables) ? "*" : t->tablename));
-					return;
-				}
-			}
-		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		return;
 	}
 
 	/* Add tables */
-	if (list_length(data->add_tables) > 0)
+	if (!pg_add_by_table(data->add_tables, schemaname, tablename))
 	{
-		ListCell	*lc;
-		bool		skip = true;
-
-		/* all tables in all schemas are added by default */
-		foreach(lc, data->add_tables)
-		{
-			SelectTable	*t = lfirst(lc);
-
-			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
-			{
-				if (t->alltables || strcmp(t->tablename, tablename) == 0)
-				{
-					elog(DEBUG2, "\"%s\".\"%s\" was added",
-								((t->allschemas) ? "*" : t->schemaname),
-								((t->alltables) ? "*" : t->tablename));
-					skip = false;
-				}
-			}
-		}
-
-		/* table was not found */
-		if (skip)
-			return;
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		return;
 	}
 
-	/* Sanity checks */
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
@@ -1193,15 +1744,34 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	escape_json(ctx->out, NameStr(class_form->relname));
 	appendStringInfo(ctx->out, ",%s", data->nl);
 
+	if (data->include_pk)
+#if	PG_VERSION_NUM >= 100000
+		pkbs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PRIMARY_KEY);
+#else
+		pkbs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+#endif
+
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
 			/* Print the new tuple */
-			columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, false);
+			if (data->include_pk && OidIsValid(relation->rd_replidindex) &&
+					relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT)
+			{
+				columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, true, relation);
+				pk_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, pkbs, false);
+			}
+			else
+			{
+				columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, false, relation);
+			}
 			break;
 		case REORDER_BUFFER_CHANGE_UPDATE:
 			/* Print the new tuple */
-			columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, true);
+			columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, true, relation);
+			if (data->include_pk && OidIsValid(relation->rd_replidindex) &&
+					relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT)
+				pk_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, pkbs, true);
 
 			/*
 			 * The old tuple is available when:
@@ -1216,17 +1786,8 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			{
 				elog(DEBUG1, "old tuple is null");
 
-				indexrel = RelationIdGetRelation(relation->rd_replidindex);
-				if (indexrel != NULL)
-				{
-					indexdesc = RelationGetDescr(indexrel);
-					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, indexdesc);
-					RelationClose(indexrel);
-				}
-				else
-				{
-					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, NULL);
-				}
+				ribs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, ribs);
 			}
 			else
 			{
@@ -1235,18 +1796,12 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			}
 			break;
 		case REORDER_BUFFER_CHANGE_DELETE:
-			/* Print the replica identity */
-			indexrel = RelationIdGetRelation(relation->rd_replidindex);
-			if (indexrel != NULL)
-			{
-				indexdesc = RelationGetDescr(indexrel);
-				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, indexdesc);
-				RelationClose(indexrel);
-			}
-			else
-			{
-				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, NULL);
-			}
+			if (data->include_pk && OidIsValid(relation->rd_replidindex) &&
+					relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT)
+				pk_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, pkbs, true);
+
+			ribs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+			identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, ribs);
 
 			if (change->data.tp.oldtuple == NULL)
 				elog(DEBUG1, "old tuple is null");
@@ -1256,6 +1811,9 @@ pg_decode_change_v1(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		default:
 			Assert(false);
 	}
+
+	bms_free(pkbs);
+	bms_free(ribs);
 
 	appendStringInfo(ctx->out, "%s%s}", data->ht, data->ht);
 
@@ -1353,8 +1911,8 @@ pg_decode_write_tuple(LogicalDecodingContext *ctx, Relation relation, HeapTuple 
 {
 	JsonDecodingData	*data;
 	TupleDesc			tupdesc;
-	Relation			idxrel;
-	TupleDesc			idxdesc = NULL;
+	Relation			defrel = NULL;
+	Bitmapset			*bs = NULL;
 	int					i;
 	Datum				*values;
 	bool				*nulls;
@@ -1372,70 +1930,47 @@ pg_decode_write_tuple(LogicalDecodingContext *ctx, Relation relation, HeapTuple 
 	/* figure out replica identity columns */
 	if (kind == PGOUTPUTJSON_IDENTITY)
 	{
-		if (OidIsValid(relation->rd_replidindex))		/* REPLICA IDENTITY INDEX */
-		{
-			idxrel = RelationIdGetRelation(relation->rd_replidindex);
-			idxdesc = RelationGetDescr(idxrel);
-		}
+		bs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+	}
+	else if (kind == PGOUTPUTJSON_PK)
+	{
 #if	PG_VERSION_NUM >= 100000
-		else if (OidIsValid(relation->rd_pkindex))	/* REPLICA IDENTITY DEFAULT + PK (10+) */
-		{
-			idxrel = RelationIdGetRelation(relation->rd_pkindex);
-			idxdesc = RelationGetDescr(idxrel);
-		}
+		bs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_PRIMARY_KEY);
 #else
-		else if (relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT && OidIsValid(relation->rd_replidindex))	/* 9.4, 9.5 and 9.6 */
-		{
-			idxrel = RelationIdGetRelation(relation->rd_replidindex);
-			idxdesc = RelationGetDescr(idxrel);
-		}
+		bs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
 #endif
-		else if (relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
-			elog(ERROR, "table does not have primary key or replica identity");
+	}
+
+	/* open pg_attrdef in preparation to get default values from columns */
+	if (kind == PGOUTPUTJSON_CHANGE && data->include_default)
+	{
+#if PG_VERSION_NUM >= 120000
+		defrel = table_open(AttrDefaultRelationId, AccessShareLock);
+#else
+		defrel = heap_open(AttrDefaultRelationId, AccessShareLock);
+#endif
 	}
 
 	for (i = 0; i < tupdesc->natts; i++)
 	{
 		Form_pg_attribute	attr;
-		int					j;
-		bool				found = false;
-		char				*type_str;
 
+#if (PG_VERSION_NUM >= 90600 && PG_VERSION_NUM < 90605) || (PG_VERSION_NUM >= 90500 && PG_VERSION_NUM < 90509) || (PG_VERSION_NUM >= 90400 && PG_VERSION_NUM < 90414)
+		attr = tupdesc->attrs[i];
+#else
 		attr = TupleDescAttr(tupdesc, i);
+#endif
 
 		/* skip dropped or system columns */
 		if (attr->attisdropped || attr->attnum < 0)
 			continue;
 
-		/*
-		 * oldtuple contains NULL on those values that are not defined by
-		 * REPLICA IDENTITY. In this case, print only non-null values.
-		 */
-		if (nulls[i] && kind == PGOUTPUTJSON_IDENTITY)
+		if (bs != NULL && !bms_is_member(attr->attnum - FirstLowInvalidHeapAttributeNumber, bs))
 			continue;
 
 		/* don't send unchanged TOAST Datum */
 		if (!nulls[i] && attr->attlen == -1 && VARATT_IS_EXTERNAL_ONDISK(values[i]))
 			continue;
-
-		/*
-		 * Is it replica identity column? Print only those columns or all
-		 * columns if REPLICA IDENTITY FULL is set.
-		 */
-		if (kind == PGOUTPUTJSON_IDENTITY && relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
-		{
-			for (j = 0; j < idxdesc->natts; j++)
-			{
-				Form_pg_attribute	iattr;
-
-				iattr = TupleDescAttr(idxdesc, j);
-				if (strcmp(NameStr(attr->attname), NameStr(iattr->attname)) == 0)
-					found = true;
-			}
-
-			if (!found)
-				continue;
-		}
 
 		if (need_sep)
 			appendStringInfoChar(ctx->out, ',');
@@ -1448,14 +1983,54 @@ pg_decode_write_tuple(LogicalDecodingContext *ctx, Relation relation, HeapTuple 
 		/* type name (with typmod, if available) */
 		if (data->include_types)
 		{
-			type_str = format_type_with_typemod(attr->atttypid, attr->atttypmod);
+			HeapTuple		type_tuple;
+			Form_pg_type	type_form;
+			char			*type_str;
+			int				len;
+
+			type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(attr->atttypid));
+			type_form = (Form_pg_type) GETSTRUCT(type_tuple);
+
+			/*
+			 * It is a domain. Replace domain name with base data type if
+			 * include_domain_data_type is enabled.
+			 */
+			if (type_form->typtype == TYPTYPE_DOMAIN && data->include_domain_data_type)
+				type_str = format_type_with_typemod(type_form->typbasetype, type_form->typtypmod);
+			else
+				type_str = format_type_with_typemod(attr->atttypid, attr->atttypmod);
+
 			appendStringInfoString(ctx->out, ",\"type\":");
-			appendStringInfo(ctx->out, "\"%s\"", type_str);
+			/*
+			 * format_type_with_typemod() returns a quoted identifier, if
+			 * required. In this case, it doesn't need to enclose the type name
+			 * in double quotes. However, if it is an array type, it should
+			 * escape it because the brackets are outside the double quotes.
+			 */
+			len = strlen(type_str);
+			if (type_str[0] == '"' && type_str[len -1] != ']')
+				appendStringInfo(ctx->out, "%s", type_str);
+			else
+				escape_json(ctx->out, type_str);
 			pfree(type_str);
+
+			ReleaseSysCache(type_tuple);
 		}
 
-		appendStringInfoString(ctx->out, ",\"value\":");
-		pg_decode_write_value(ctx, values[i], nulls[i], attr->atttypid);
+		/*
+		 * Print type oid for columns.
+		 */
+		if (data->include_type_oids)
+		{
+			appendStringInfoString(ctx->out, ",\"typeoid\":");
+			appendStringInfo(ctx->out, "%d", attr->atttypid);
+		}
+
+		if (kind != PGOUTPUTJSON_PK)
+		{
+			appendStringInfoString(ctx->out, ",\"value\":");
+			pg_decode_write_value(ctx, values[i], nulls[i], attr->atttypid);
+		}
 
 		/*
 		 * Print optional for columns. This information is redundant for
@@ -1469,8 +2044,96 @@ pg_decode_write_tuple(LogicalDecodingContext *ctx, Relation relation, HeapTuple 
 				appendStringInfoString(ctx->out, ",\"optional\":true");
 		}
 
+		/*
+		 * Print position for columns. Positions are only available for new
+		 * tuple (INSERT, UPDATE).
+		 */
+		if (kind == PGOUTPUTJSON_CHANGE && data->include_column_positions)
+		{
+			appendStringInfoString(ctx->out, ",\"position\":");
+			appendStringInfo(ctx->out, "%d", attr->attnum);
+		}
+
+		/*
+		 * Print default for columns.
+		 */
+		if (kind == PGOUTPUTJSON_CHANGE && data->include_default)
+		{
+#if PG_VERSION_NUM >= 120000
+			if (attr->atthasdef && attr->attgenerated == '\0')
+#else
+			if (attr->atthasdef)
+#endif
+			{
+				ScanKeyData			scankeys[2];
+				SysScanDesc			scan;
+				HeapTuple			def_tuple;
+				Datum				def_value;
+				bool				isnull;
+				char				*result;
+
+				ScanKeyInit(&scankeys[0],
+							Anum_pg_attrdef_adrelid,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(relation->rd_id));
+				ScanKeyInit(&scankeys[1],
+							Anum_pg_attrdef_adnum,
+							BTEqualStrategyNumber, F_INT2EQ,
+							Int16GetDatum(attr->attnum));
+
+				scan = systable_beginscan(defrel, AttrDefaultIndexId, true,
+											NULL, 2, scankeys);
+
+				def_tuple = systable_getnext(scan);
+				if (HeapTupleIsValid(def_tuple))
+				{
+					def_value = fastgetattr(def_tuple, Anum_pg_attrdef_adbin, defrel->rd_att, &isnull);
+
+					if (!isnull)
+					{
+						result = TextDatumGetCString(DirectFunctionCall2(pg_get_expr,
+																	def_value,
+																	ObjectIdGetDatum(relation->rd_id)));
+
+						appendStringInfoString(ctx->out, ",\"default\":");
+						appendStringInfo(ctx->out, "\"%s\"", result);
+						pfree(result);
+					}
+					else
+					{
+						/*
+						 * null means that default was not set. Is it possible?
+						 * atthasdef shouldn't be set.
+						 */
+						appendStringInfoString(ctx->out, ",\"default\":null");
+					}
+				}
+
+				systable_endscan(scan);
+			}
+			else
+			{
+				/*
+				 * no DEFAULT clause implicitly means that the default is NULL
+				 */
+				appendStringInfoString(ctx->out, ",\"default\":null");
+			}
+		}
+
 		appendStringInfoChar(ctx->out, '}');
 	}
+
+	/* close pg_attrdef */
+	if (kind == PGOUTPUTJSON_CHANGE && data->include_default)
+	{
+#if PG_VERSION_NUM >= 120000
+		table_close(defrel, AccessShareLock);
+#else
+		heap_close(defrel, AccessShareLock);
+#endif
+	}
+
+	bms_free(bs);
 
 	pfree(values);
 	pfree(nulls);
@@ -1484,7 +2147,6 @@ pg_decode_write_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relat
 	/* make sure rd_pkindex and rd_replidindex are set */
 	RelationGetIndexList(relation);
 
-	/* sanity checks */
 	switch (change->action)
 	{
 		case REORDER_BUFFER_CHANGE_INSERT:
@@ -1555,7 +2217,7 @@ pg_decode_write_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relat
 
 	if (data->include_lsn)
 	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, change->lsn));
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(change->lsn)));
 		appendStringInfo(ctx->out, ",\"lsn\":\"%s\"", lsn_str);
 		pfree(lsn_str);
 	}
@@ -1635,6 +2297,23 @@ pg_decode_write_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn, Relat
 		}
 	}
 
+	if (data->include_pk)
+	{
+		appendStringInfoString(ctx->out, ",\"pk\":[");
+#if	PG_VERSION_NUM >= 100000
+		if (OidIsValid(relation->rd_pkindex))
+#else
+		if (OidIsValid(relation->rd_replidindex) && relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT)
+#endif
+		{
+			if (change->data.tp.oldtuple != NULL)
+				pg_decode_write_tuple(ctx, relation, &change->data.tp.oldtuple->tuple, PGOUTPUTJSON_PK);
+			else
+				pg_decode_write_tuple(ctx, relation, &change->data.tp.newtuple->tuple, PGOUTPUTJSON_PK);
+		}
+		appendStringInfoChar(ctx->out, ']');
+	}
+
 	appendStringInfoChar(ctx->out, '}');
 
 	OutputPluginWrite(ctx, true);
@@ -1650,6 +2329,10 @@ pg_decode_change_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	char	*schemaname;
 	char	*tablename;
 
+	/* filter changes by action */
+	if (pg_filter_by_action(change->action, data->actions))
+		return;
+
 	/* avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
 
@@ -1658,53 +2341,19 @@ pg_decode_change_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	tablename = RelationGetRelationName(relation);
 
 	/* Exclude tables, if available */
-	if (list_length(data->filter_tables) > 0)
+	if (pg_filter_by_table(data->filter_tables, schemaname, tablename))
 	{
-		ListCell	*lc;
-
-		foreach(lc, data->filter_tables)
-		{
-			SelectTable	*t = lfirst(lc);
-
-			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
-			{
-				if (t->alltables || strcmp(t->tablename, tablename) == 0)
-				{
-					elog(DEBUG2, "\"%s\".\"%s\" was filtered out",
-								((t->allschemas) ? "*" : t->schemaname),
-								((t->alltables) ? "*" : t->tablename));
-					return;
-				}
-			}
-		}
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		return;
 	}
 
 	/* Add tables */
-	if (list_length(data->add_tables) > 0)
+	if (!pg_add_by_table(data->add_tables, schemaname, tablename))
 	{
-		ListCell	*lc;
-		bool		skip = true;
-
-		/* all tables in all schemas are added by default */
-		foreach(lc, data->add_tables)
-		{
-			SelectTable	*t = lfirst(lc);
-
-			if (t->allschemas || strcmp(t->schemaname, schemaname) == 0)
-			{
-				if (t->alltables || strcmp(t->tablename, tablename) == 0)
-				{
-					elog(DEBUG2, "\"%s\".\"%s\" was added",
-								((t->allschemas) ? "*" : t->schemaname),
-								((t->alltables) ? "*" : t->tablename));
-					skip = false;
-				}
-			}
-		}
-
-		/* table was not found */
-		if (skip)
-			return;
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		return;
 	}
 
 	pg_decode_write_change(ctx, txn, relation, change);
@@ -1886,7 +2535,7 @@ pg_decode_message_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	if (data->include_lsn)
 	{
-		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, lsn));
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(lsn)));
 		appendStringInfo(ctx->out, ",\"lsn\":\"%s\"", lsn_str);
 		pfree(lsn_str);
 	}
@@ -1907,6 +2556,197 @@ pg_decode_message_v2(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 
 	appendStringInfoChar(ctx->out, '}');
 	OutputPluginWrite(ctx, true);
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(data->context);
+}
+#endif
+
+#if	PG_VERSION_NUM >= 110000
+/* Callback for TRUNCATE command */
+static void pg_decode_truncate(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change)
+{
+	JsonDecodingData *data = ctx->output_plugin_private;
+
+	if (data->format_version == 2)
+		pg_decode_truncate_v2(ctx, txn, n, relations, change);
+	else if (data->format_version == 1)
+		pg_decode_truncate_v1(ctx, txn, n, relations, change);
+	else
+		elog(ERROR, "format version %d is not supported", data->format_version);
+}
+
+static void pg_decode_truncate_v1(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change)
+{
+#ifdef	_NOT_USED
+	JsonDecodingData *data;
+	MemoryContext old;
+	int		i;
+
+	data = ctx->output_plugin_private;
+
+	if (!data->actions.truncate)
+	{
+		elog(DEBUG3, "ignore TRUNCATE");
+		return;
+	}
+
+	/* Avoid leaking memory by using and resetting our own context */
+	old = MemoryContextSwitchTo(data->context);
+
+	/* Exclude tables, if available */
+	if (pg_filter_by_table(data->filter_tables, schemaname, tablename))
+	{
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		continue;
+	}
+
+	/* Add tables */
+	if (!pg_add_by_table(data->add_tables, schemaname, tablename))
+	{
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+		continue;
+	}
+
+	if (data->write_in_chunks)
+		OutputPluginPrepareWrite(ctx, true);
+
+	/*
+	 * increment counter only for transactional messages because
+	 * non-transactional message has only one object.
+	 */
+	data->nr_changes++;
+
+	/* if we don't write in chunks, we need a newline here */
+	if (!data->write_in_chunks)
+			appendStringInfo(ctx->out, "%s", data->nl);
+
+	appendStringInfo(ctx->out, "%s%s", data->ht, data->ht);
+
+	if (data->nr_changes > 1)
+		appendStringInfoChar(ctx->out, ',');
+
+	appendStringInfo(ctx->out, "{%s%s%s%s\"kind\":%s\"truncate\",%s", data->nl, data->ht, data->ht, data->ht, data->sp, data->nl);
+
+	if (data->include_xids)
+		appendStringInfo(ctx->out, "%s%s%s\"xid\":%s%u,%s", data->ht, data->ht, data->ht, data->sp, txn->xid, data->nl);
+
+	if (data->include_timestamp)
+		appendStringInfo(ctx->out, "%s%s%s\"timestamp\":%s\"%s\",%s", data->ht, data->ht, data->ht, data->sp, timestamptz_to_str(txn->commit_time), data->nl);
+
+	if (data->include_origin)
+		appendStringInfo(ctx->out, "%s%s%s\"origin\":%s%u,%s", data->ht, data->ht, data->ht, data->sp, txn->origin_id, data->nl);
+
+	if (data->include_lsn)
+	{
+		char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(change->lsn)));
+		appendStringInfo(ctx->out, "%s%s%s\"lsn\":%s\"%s\",%s", data->ht, data->ht, data->ht, data->sp, lsn_str, data->nl);
+		pfree(lsn_str);
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		if (data->include_schemas)
+		{
+			appendStringInfo(ctx->out, "%s%s%s\"schema\":%s", data->ht, data->ht, data->ht, data->sp);
+			escape_json(ctx->out, get_namespace_name(RelationGetNamespace(relations[i])));
+			appendStringInfo(ctx->out, ",%s", data->nl);
+		}
+
+		appendStringInfo(ctx->out, "%s%s%s\"table\":%s", data->ht, data->ht, data->ht, data->sp);
+		escape_json(ctx->out, RelationGetRelationName(relations[i]));
+	}
+
+	appendStringInfo(ctx->out, "%s%s%s}", data->nl, data->ht, data->ht);
+
+	MemoryContextSwitchTo(old);
+	MemoryContextReset(data->context);
+
+	if (data->write_in_chunks)
+		OutputPluginWrite(ctx, true);
+#endif
+}
+
+static void pg_decode_truncate_v2(LogicalDecodingContext *ctx,
+					ReorderBufferTXN *txn, int n, Relation relations[],
+					ReorderBufferChange *change)
+{
+	JsonDecodingData *data = ctx->output_plugin_private;
+	MemoryContext old;
+	int		i;
+
+	if (!data->actions.truncate)
+	{
+		elog(DEBUG3, "ignore TRUNCATE");
+		return;
+	}
+
+	/* avoid leaking memory by using and resetting our own context */
+	old = MemoryContextSwitchTo(data->context);
+
+	for (i = 0; i < n; i++)
+	{
+		char	*schemaname;
+		char	*tablename;
+
+		/* schema and table names are used for chosen tables */
+		schemaname = get_namespace_name(RelationGetNamespace(relations[i]));
+		tablename = RelationGetRelationName(relations[i]);
+
+		/* Exclude tables, if available */
+		if (pg_filter_by_table(data->filter_tables, schemaname, tablename))
+		{
+			MemoryContextSwitchTo(old);
+			MemoryContextReset(data->context);
+			continue;
+		}
+
+		/* Add tables */
+		if (!pg_add_by_table(data->add_tables, schemaname, tablename))
+		{
+			MemoryContextSwitchTo(old);
+			MemoryContextReset(data->context);
+			continue;
+		}
+
+		OutputPluginPrepareWrite(ctx, true);
+		appendStringInfoChar(ctx->out, '{');
+		appendStringInfoString(ctx->out, "\"action\":\"T\"");
+
+		if (data->include_xids)
+			appendStringInfo(ctx->out, ",\"xid\":%u", txn->xid);
+
+		if (data->include_timestamp)
+			appendStringInfo(ctx->out, ",\"timestamp\":\"%s\"", timestamptz_to_str(txn->commit_time));
+
+		if (data->include_origin)
+			appendStringInfo(ctx->out, ",\"origin\":%u", txn->origin_id);
+
+		if (data->include_lsn)
+		{
+			char *lsn_str = DatumGetCString(DirectFunctionCall1(pg_lsn_out, UInt64GetDatum(change->lsn)));
+			appendStringInfo(ctx->out, ",\"lsn\":\"%s\"", lsn_str);
+			pfree(lsn_str);
+		}
+
+		if (data->include_schemas)
+		{
+			appendStringInfo(ctx->out, ",\"schema\":");
+			escape_json(ctx->out, schemaname);
+		}
+
+		appendStringInfo(ctx->out, ",\"table\":");
+		escape_json(ctx->out, tablename);
+
+		appendStringInfoChar(ctx->out, '}');
+		OutputPluginWrite(ctx, true);
+	}
 
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(data->context);
@@ -2114,6 +2954,69 @@ split_string_to_list(char *rawstring, char separator, List **sl)
 		 */
 		pname = pstrdup(curname);
 		*sl = lappend(*sl, pname);
+
+		/* Loop back if we didn't reach end of string */
+	} while (!done);
+
+	return true;
+}
+
+/*
+ * Convert a string into a list of Oids
+ */
+static bool
+split_string_to_oid_list(char *rawstring, char separator, List **sl)
+{
+	char	   *nextp;
+	bool		done = false;
+
+	nextp = rawstring;
+
+	while (isspace(*nextp))
+		nextp++;				/* skip leading whitespace */
+
+	if (*nextp == '\0')
+		return true;			/* allow empty string */
+
+	/* At the top of the loop, we are at start of a new identifier. */
+	do
+	{
+		char	   *tok;
+		char	   *endp;
+		Oid			originid;
+
+		tok = nextp;
+		while (*nextp && *nextp != separator && !isspace(*nextp))
+		{
+			if (*nextp == '\\')
+				nextp++;	/* ignore next character because of escape */
+			nextp++;
+		}
+		endp = nextp;
+
+		while (isspace(*nextp))
+			nextp++;			/* skip trailing whitespace */
+
+		if (*nextp == separator)
+		{
+			nextp++;
+			while (isspace(*nextp))
+				nextp++;		/* skip leading whitespace for next */
+			/* we expect another name, so done remains false */
+		}
+		else if (*nextp == '\0')
+			done = true;
+		else
+			return false;		/* invalid syntax */
+
+		/* Now safe to overwrite separator with a null */
+		*endp = '\0';
+
+		/*
+		 * Finished isolating origin id --- add it to list
+		 */
+		originid = (Oid) atoi(tok);
+		*sl = lappend_oid(*sl, originid);
 
 		/* Loop back if we didn't reach end of string */
 	} while (!done);
